@@ -1106,6 +1106,31 @@ See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a star
 
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Quota-conserving standing default
+
+`AGENTS.md` section 4 owns the always-loaded standing default: workers run on the free model at a moderate effort, a paid or stronger model is a captain choice, effort is chosen per task, and concurrent worker count is bounded rather than filling every free slot.
+This section owns the operator-facing mechanics behind that default.
+
+**Why the default exists**
+
+On 2026-10-03 an evening of four concurrent workers on the OpenCode Go plan, two of them long unattended runs at high or maximum reasoning, consumed 100% of that plan's rolling five-hour window in roughly fifty minutes, about 5.7x the rate the window sustains, and every worker then stopped on usage-limit refusals with its work parked.
+The provider reported one account-level figure with no per-model breakdown, so no single model can be blamed: concurrency plus reasoning level is the cause.
+The same shape recurs on any small rolling window, so this rule describes the shape rather than naming one plan's window sizes.
+No plan's window sizes are recorded in this repo because they are per-plan, per-provider facts that change; read the live figures from `quota-axi` at intake instead of hardcoding numbers.
+
+**Enforcement surfaces**
+
+- A `default` or rule `use` profile in `config/crew-dispatch.json` is where effort and model are chosen per home; [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) shows a default profile array that already resolves at moderate effort.
+- Rule and profile `floor` values bound a candidate that is already too low on a named scope, which keeps an intake from choosing a nearly empty window.
+- `quota-axi`'s default TOON reports `effectivePercentRemaining`, `runway`, `resetsAt`, and `spendPriority`, and `quota-array-dispatch` owns ranking candidates from that snapshot.
+- The opt-in `bin/fm-procevent-quota.sh` wakes a task mid-run when its tracked provider crosses a configured remaining-percent or `exhausted_now` threshold.
+- Bounding concurrency is an intake decision that no floor makes for you: a floor only makes one candidate ineligible, while how many workers launch at once is firstmate's call against the window that is left.
+
+**What stays legitimate**
+
+A design or judgement task that genuinely needs top reasoning, and any model or effort the captain names, may use a stronger model, and the captain's word is recorded in the task note when the spend is the captain's money.
+`AGENTS.md` section 4's strongest-reasoning rule and the `harness-adapters` effort fallback still govern that case; this section adds the spend discipline around it, not an exception to it.
+
 ## Typed dispatch resolution (.env TYPESAFE_API_KEY)
 
 `bin/fm-dispatch-resolve.sh` resolves one concrete crewmate or scout profile from a written brief with typesafe.ai's System One model (Jev), so the rule match that firstmate otherwise reasons out in its own context becomes one short tool turn.

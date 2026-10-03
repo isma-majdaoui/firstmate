@@ -112,6 +112,16 @@ Do not add model-specific versions of that policy.
 Dispatch only on a backend that `fm-spawn` validates as spawn-capable; pass an explicit per-spawn `--backend` only under that exact task's own authority, never as later-task precedent (selection contract: [`docs/configuration.md`](docs/configuration.md) "Runtime backend").
 A missing dependency, authentication failure, unsupported backend, or version refusal is a blocker; never silently retry on another backend.
 
+### Standing quota-conserving default
+
+- Workers run on the provider's free model at a moderate effort unless a configured dispatch rule, an explicit captain instruction, or a genuinely reasoning-bound task says otherwise.
+- A paid or stronger model is an explicit captain choice rather than a dispatch default, and record the captain's word in the task note whenever the captain's own money pays for it.
+- Choose effort per task under the `harness-adapters` fallback instead of defaulting to `high`, `xhigh`, or `max`.
+- Bound concurrent worker count by the window that is left rather than filling every free slot: what drains a small rolling window is several concurrent lanes at high effort, not one long task.
+- `config/crew-dispatch.json` is where a home encodes this decision, `quota-axi` reports the remaining window, and `quota-array-dispatch` ranks candidates by `spendPriority`, so check this rule against evidence at every intake rather than from memory.
+- This is not a blanket ban: a design or judgement task that genuinely needs top reasoning, and any model or effort the captain names, may use a stronger model.
+- Operator-facing mechanics, the recorded incident that motivated this rule, and its enforcement surfaces live in [`docs/configuration.md`](docs/configuration.md) "Quota-conserving standing default", which is their single owner.
+
 ## 5. Recovery
 
 After the one session-start digest, reconcile reality with durable records before taking new work.
