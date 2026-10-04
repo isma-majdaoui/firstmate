@@ -1121,9 +1121,9 @@ No plan's window sizes are recorded in this repo because they are per-plan, per-
 **Enforcement surfaces**
 
 - A `default` or rule `use` profile in `config/crew-dispatch.json` is where effort and model are chosen per home; [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) shows a default profile array that already resolves at moderate effort.
-- Rule and profile `floor` values bound a candidate that is already too low on a named scope, which keeps an intake from choosing a nearly empty window.
+- Rule and profile `floor` values bound a candidate that is already too low on a named scope, which keeps an intake from choosing a nearly empty window; they bind in code only under [typed dispatch resolution](#typed-dispatch-resolution-env-typesafe_api_key), and are otherwise intake hints the resolver never applies.
 - `quota-axi`'s default TOON reports `effectivePercentRemaining`, `runway`, `resetsAt`, and `spendPriority`, and `quota-array-dispatch` owns ranking candidates from that snapshot.
-- The opt-in `bin/fm-procevent-quota.sh` wakes a task mid-run when its tracked provider crosses a configured remaining-percent or `exhausted_now` threshold.
+- The opt-in `bin/fm-procevent-quota.sh` wakes firstmate mid-run when its tracked provider crosses a configured remaining-percent or `exhausted_now` threshold, and firstmate then decides whether the active work continues or moves.
 - Bounding concurrency is an intake decision that no floor makes for you: a floor only makes one candidate ineligible, while how many workers launch at once is firstmate's call against the window that is left.
 
 **What stays legitimate**
