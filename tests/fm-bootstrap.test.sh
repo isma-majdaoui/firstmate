@@ -251,6 +251,104 @@ assert_timeout_report() {
 #   mode=empty -> output must be empty (expect/notcontains ignored)
 #   mode=exact -> output must equal <expect>
 #   mode=grep  -> output must contain <expect> (fixed string); <notcontains> must not appear
+# A version-probe tool that records every `--version` shell-out it receives, so
+# the suite can count real process invocations rather than infer memoisation from
+# output. FM_FAKE_PROBE_VERSION_DIR carries the version file it answers with
+# (one per tool, named after the tool), and FM_FAKE_PROBE_SLEEP makes it slow
+# enough to hit a probe bound.
+make_counting_probe_tool() {  # <fakebin> <tool>
+  cat > "$1/$2" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'probe %s\n' "$(basename "$0")" >> "${FM_FAKE_PROBE_LOG:?}"
+  [ "${FM_FAKE_PROBE_SLEEP:-0}" = 0 ] || sleep "$FM_FAKE_PROBE_SLEEP"
+  cat "${FM_FAKE_PROBE_VERSION_DIR:?}/$(basename "$0")"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$1/$2"
+}
+
+probe_count() {  # <log> <tool>
+  if [ ! -f "$1" ]; then
+    printf '0'
+    return 0
+  fi
+  grep -c "^probe $2\$" "$1" 2>/dev/null || printf '0'
+}
+
+# A home whose probed tools are counting fakes. Echoes the case dir; the caller
+# reads the fakebin path from the same layout make_fake_toolchain uses.
+make_probe_counting_case() {  # <case-name>
+  local case_dir=$1 fakebin tool
+  case_dir="$TMP_ROOT/$1"
+  mkdir -p "$case_dir/home/config" "$case_dir/versions"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  # Every probed tool sits at its own current floor, so a run over this toolchain
+  # evaluates all of its floors and stays silent.
+  printf '%s\n' 0.1.80 > "$case_dir/versions/lavish-axi"
+  printf '%s\n' 0.1.29 > "$case_dir/versions/gh-axi"
+  printf '%s\n' 1.46.0 > "$case_dir/versions/no-mistakes"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  for tool in lavish-axi gh-axi no-mistakes; do
+    make_counting_probe_tool "$fakebin" "$tool"
+  done
+  printf '%s\n' "$case_dir"
+}
+
+test_version_floor_probe_runs_once_per_tool() {
+  local case_dir log out tool
+  case_dir=$(make_probe_counting_case probe-once)
+  log="$case_dir/probes.log"
+  out=$(PATH="$case_dir/fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_PROBE_LOG="$log" \
+    FM_FAKE_PROBE_VERSION_DIR="$case_dir/versions" \
+    FM_FAKE_LAVISH_AXI_VERSION=0.1.80 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  # lavish-axi sits above LAVISH_AXI_BOARD_MIN and at LAVISH_AXI_MIN, so this run
+  # evaluates both of its floors; each must read the one probe it already paid.
+  [ -z "$out" ] || fail "compatible probing toolchain should be silent, got: $out"
+  for tool in lavish-axi gh-axi no-mistakes; do
+    [ "$(probe_count "$log" "$tool")" = 1 ] \
+      || fail "$tool: expected exactly one --version invocation, log: $(cat "$log" 2>/dev/null)"
+  done
+  # The memo is process-local: a second run probes again rather than reading a
+  # verdict cached across runs.
+  : > "$log"
+  PATH="$case_dir/fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_PROBE_LOG="$log" \
+    FM_FAKE_PROBE_VERSION_DIR="$case_dir/versions" \
+    FM_FAKE_LAVISH_AXI_VERSION=0.1.80 "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
+  [ "$(probe_count "$log" lavish-axi)" = 1 ] \
+    || fail "second run must probe again, log: $(cat "$log" 2>/dev/null)"
+  pass "bootstrap pays at most one version probe per tool per run, and never across runs"
+}
+
+test_version_probe_bound_reports_the_verdict() {
+  local case_dir log out started ended elapsed
+  case_dir=$(make_probe_counting_case probe-bound)
+  log="$case_dir/probes.log"
+  started=$(date +%s)
+  out=$(PATH="$case_dir/fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_PROBE_LOG="$log" \
+    FM_FAKE_PROBE_VERSION_DIR="$case_dir/versions" FM_FAKE_PROBE_SLEEP=30 \
+    FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  ended=$(date +%s)
+  elapsed=$((ended - started))
+  [ "$elapsed" -lt 25 ] || fail "bounded probes should not wait on a hanging tool, elapsed=${elapsed}s"
+  # A bounded-out probe is reported as an actionable line naming the bound, never
+  # as silence and never as a satisfied floor.
+  printf '%s\n' "$out" | grep -F 'version probe hit the 1s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound' >/dev/null \
+    || fail "expected a bound-naming diagnostic, got: $out"
+  printf '%s\n' "$out" | grep -Fx 'MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks; version probe hit the 1s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)' >/dev/null \
+    || fail "expected the bounded gh-axi line, got: $out"
+  printf '%s\n' "$out" | grep -F 'PRESENTATION_UNAVAILABLE: lavish-axi (requires >=0.1.77; install: npm install -g lavish-axi && lavish-axi setup hooks; version probe hit the 1s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound' >/dev/null \
+    || fail "expected the bounded lavish-axi line, got: $out"
+  [ "$(probe_count "$log" gh-axi)" = 1 ] \
+    || fail "a bounded probe must not be retried per floor, log: $(cat "$log" 2>/dev/null)"
+  pass "a version probe that hits its bound reports the verdict instead of hanging or passing"
+}
+
 test_bootstrap_reporting() {
   local label lease tasks quota backend mode expect notcontains case_dir fakebin out n archive_body multi_id
   n=0
@@ -1248,6 +1346,8 @@ test_bootstrap_reporting
 test_no_mistakes_min_version
 test_gh_axi_min_version
 test_lavish_axi_min_version
+test_version_floor_probe_runs_once_per_tool
+test_version_probe_bound_reports_the_verdict
 test_tasks_axi_min_version
 test_quota_axi_min_version
 test_git_is_required_with_supported_install_instruction
