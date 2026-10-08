@@ -45,15 +45,21 @@ FM_QUOTA_ROW_JQ='
 '
 
 fm_quota_axi_compatible() {
-  local timeout=${1:-} output parts major minor patch extra
+  local timeout=${1:-} output parts major minor patch extra status
   local min_major min_minor min_patch min_extra
+  FM_QUOTA_AXI_PROBE_TIMED_OUT=
   command -v quota-axi >/dev/null 2>&1 || return 1
   if [ -n "$timeout" ]; then
     case "$timeout" in
       ''|*[!0-9]*|0) return 1 ;;
     esac
     [ "$(type -t fm_run_timed)" = function ] || return 1
-    output=$(fm_run_timed "$timeout" quota-axi --version 2>/dev/null </dev/null) || return 1
+    output=$(fm_run_timed "$timeout" quota-axi --version 2>/dev/null </dev/null)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+      fm_timed_out "$status" && FM_QUOTA_AXI_PROBE_TIMED_OUT=1
+      return 1
+    fi
   else
     output=$(quota-axi --version 2>/dev/null </dev/null) || return 1
   fi

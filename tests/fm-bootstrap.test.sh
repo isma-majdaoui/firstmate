@@ -275,7 +275,39 @@ probe_count() {  # <log> <tool>
     printf '0'
     return 0
   fi
-  grep -c "^probe $2\$" "$1" 2>/dev/null || printf '0'
+  # grep -c prints 0 and exits nonzero on no match, so the status must be
+  # swallowed rather than turned into a second 0.
+  grep -c "^probe $2\$" "$1" 2>/dev/null || true
+}
+
+# The tasks-axi counting probe records each of its three probe kinds under its
+# own label, answers with the compatibility-complete help text, and sleeps like
+# the other counting probes when FM_FAKE_PROBE_SLEEP is set.
+make_counting_tasks_axi_probe() {  # <fakebin>
+  cat > "$1/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+log_probe() {
+  printf 'probe %s\n' "$1" >> "${FM_FAKE_PROBE_LOG:?}"
+  [ "${FM_FAKE_PROBE_SLEEP:-0}" = 0 ] || sleep "$FM_FAKE_PROBE_SLEEP"
+}
+if [ "${1:-}" = --version ]; then
+  log_probe tasks-axi-version
+  cat "${FM_FAKE_PROBE_VERSION_DIR:?}/tasks-axi"
+  exit 0
+fi
+if [ "${1:-}" = update ] && [ "${2:-}" = --help ]; then
+  log_probe tasks-axi-update-help
+  printf '%s\n' 'usage: tasks-axi update <id> [flags]' '  --archive-body'
+  exit 0
+fi
+if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
+  log_probe tasks-axi-mv-help
+  printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$1/tasks-axi"
 }
 
 # A home whose probed tools are counting fakes. Echoes the case dir; the caller
@@ -290,10 +322,13 @@ make_probe_counting_case() {  # <case-name>
   printf '%s\n' 0.1.80 > "$case_dir/versions/lavish-axi"
   printf '%s\n' 0.1.29 > "$case_dir/versions/gh-axi"
   printf '%s\n' 1.46.0 > "$case_dir/versions/no-mistakes"
+  printf '%s\n' 0.1.51 > "$case_dir/versions/quota-axi"
+  printf '%s\n' 0.2.6 > "$case_dir/versions/tasks-axi"
   fakebin=$(make_fake_toolchain "$case_dir")
-  for tool in lavish-axi gh-axi no-mistakes; do
+  for tool in lavish-axi gh-axi no-mistakes quota-axi; do
     make_counting_probe_tool "$fakebin" "$tool"
   done
+  make_counting_tasks_axi_probe "$fakebin"
   printf '%s\n' "$case_dir"
 }
 
@@ -308,9 +343,9 @@ test_version_floor_probe_runs_once_per_tool() {
   # lavish-axi sits above LAVISH_AXI_BOARD_MIN and at LAVISH_AXI_MIN, so this run
   # evaluates both of its floors; each must read the one probe it already paid.
   [ -z "$out" ] || fail "compatible probing toolchain should be silent, got: $out"
-  for tool in lavish-axi gh-axi no-mistakes; do
+  for tool in lavish-axi gh-axi no-mistakes quota-axi tasks-axi-version tasks-axi-update-help tasks-axi-mv-help; do
     [ "$(probe_count "$log" "$tool")" = 1 ] \
-      || fail "$tool: expected exactly one --version invocation, log: $(cat "$log" 2>/dev/null)"
+      || fail "$tool: expected exactly one probe invocation, log: $(cat "$log" 2>/dev/null)"
   done
   # The memo is process-local: a second run probes again rather than reading a
   # verdict cached across runs.
@@ -344,8 +379,18 @@ test_version_probe_bound_reports_the_verdict() {
     || fail "expected the bounded gh-axi line, got: $out"
   printf '%s\n' "$out" | grep -F 'PRESENTATION_UNAVAILABLE: lavish-axi (requires >=0.1.77; install: npm install -g lavish-axi && lavish-axi setup hooks; version probe hit the 1s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound' >/dev/null \
     || fail "expected the bounded lavish-axi line, got: $out"
+  printf '%s\n' "$out" | grep -Fx 'MISSING: quota-axi (install: npm install -g quota-axi; version probe hit the 1s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)' >/dev/null \
+    || fail "expected the bounded quota-axi line, got: $out"
+  printf '%s\n' "$out" | grep -Fx 'MISSING: tasks-axi (install: npm install -g tasks-axi; version probe hit the 1s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)' >/dev/null \
+    || fail "expected the bounded tasks-axi line, got: $out"
   [ "$(probe_count "$log" gh-axi)" = 1 ] \
     || fail "a bounded probe must not be retried per floor, log: $(cat "$log" 2>/dev/null)"
+  [ "$(probe_count "$log" quota-axi)" = 1 ] \
+    || fail "a bounded quota-axi probe must not be retried, log: $(cat "$log" 2>/dev/null)"
+  [ "$(probe_count "$log" tasks-axi-version)" = 1 ] \
+    || fail "a bounded tasks-axi version probe must not be retried, log: $(cat "$log" 2>/dev/null)"
+  [ "$(probe_count "$log" tasks-axi-update-help)" = 0 ] \
+    || fail "a bounded-out version probe must not be followed by feature probes, log: $(cat "$log" 2>/dev/null)"
   pass "a version probe that hits its bound reports the verdict instead of hanging or passing"
 }
 

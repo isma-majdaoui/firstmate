@@ -39,8 +39,19 @@
 #     onward into a spawned agent's environment, where it could outlive a
 #     tasks-axi upgrade. Any value other than exactly 0 or 1 is ignored and the
 #     probe runs normally.
-# Both layers are bounded by process lifetime, so a tasks-axi install or upgrade
-# is picked up by the next process rather than being cached to disk.
+#   - A parent whose probe hit its caller-supplied bound passes
+#     FM_TASKS_AXI_TIMED_OUT=1 beside the verdict so the child can name that
+#     bound when it reports the failure; consumed with the same one-hop rule.
+#   - Each probe takes an optional timeout in seconds: passed to fm_run_timed,
+#     it bounds the one tasks-axi shell-out the probe makes. A probe that hits
+#     its bound fails like any other unreadable answer and latches
+#     FM_TASKS_AXI_PROBE_TIMED_OUT=1, which fm_tasks_axi_probe_timed_out reads
+#     so the caller can name the bound instead of reporting a plain
+#     incompatibility. The bound itself travels as the probe's 124/137 exit
+#     status, because the version probe's output is captured in a command
+#     substitution whose variable assignments would never reach the caller.
+# Both reuse layers are bounded by process lifetime, so a tasks-axi install or
+# upgrade is picked up by the next process rather than being cached to disk.
 
 FM_TASKS_AXI_MIN=0.2.6
 
@@ -51,21 +62,69 @@ case "$FM_TASKS_AXI_COMPATIBLE_MEMO" in
   *) FM_TASKS_AXI_COMPATIBLE_MEMO= ;;
 esac
 
-fm_tasks_axi_version_parts() {
-  local output
+FM_TASKS_AXI_TIMED_OUT_MEMO=${FM_TASKS_AXI_TIMED_OUT:-}
+unset FM_TASKS_AXI_TIMED_OUT
+case "$FM_TASKS_AXI_TIMED_OUT_MEMO" in
+  1) ;;
+  *) FM_TASKS_AXI_TIMED_OUT_MEMO= ;;
+esac
+
+FM_TASKS_AXI_PROBE_TIMED_OUT=
+
+# One tasks-axi shell-out shared by the three probes below: prints the
+# command's output and fails nonzero like the command. $1 is the timeout in
+# seconds (empty = unbounded), $2 is the stderr mode ('merge' for 2>&1, else
+# /dev/null), and $3 onward is the tasks-axi subcommand line. In bounded mode
+# the command's status is returned verbatim, so a caller can read fm_run_timed's
+# 124/137 bound marker; in unbounded mode any failure collapses to 1.
+fm_tasks_axi_probe_run() {  # <timeout> <stderr-mode> <args...>
+  local timeout=$1 stderr_mode=$2 output status
+  shift 2
   command -v tasks-axi >/dev/null 2>&1 || return 1
-  output=$(tasks-axi --version 2>/dev/null) || return 1
+  if [ -z "$timeout" ]; then
+    if [ "$stderr_mode" = merge ]; then
+      tasks-axi "$@" 2>&1 || return 1
+    else
+      tasks-axi "$@" 2>/dev/null || return 1
+    fi
+    return 0
+  fi
+  case "$timeout" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  [ "$(type -t fm_run_timed)" = function ] || return 1
+  if [ "$stderr_mode" = merge ]; then
+    output=$(fm_run_timed "$timeout" tasks-axi "$@" 2>&1)
+  else
+    output=$(fm_run_timed "$timeout" tasks-axi "$@" 2>/dev/null)
+  fi
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  printf '%s\n' "$output"
+}
+
+fm_tasks_axi_version_parts() {  # [timeout]
+  local timeout=${1:-} output status
+  output=$(fm_tasks_axi_probe_run "$timeout" quiet --version)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    # The 124/137 bound marker must survive this command-substitution boundary
+    # as a status; a flag set inside it would die with the subshell.
+    [ -n "$timeout" ] && fm_timed_out "$status" && return "$status"
+    return 1
+  fi
   printf '%s\n' "$output" |
     sed -n 's/.*\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' |
     head -1
 }
 
-fm_tasks_axi_compatible() {
+fm_tasks_axi_compatible() {  # [timeout]
   case "$FM_TASKS_AXI_COMPATIBLE_MEMO" in
     1) return 0 ;;
     0) return 1 ;;
   esac
-  if fm_tasks_axi_compatible_probe; then
+  FM_TASKS_AXI_PROBE_TIMED_OUT=
+  if fm_tasks_axi_compatible_probe "${1:-}"; then
     FM_TASKS_AXI_COMPATIBLE_MEMO=1
     return 0
   fi
@@ -73,10 +132,23 @@ fm_tasks_axi_compatible() {
   return 1
 }
 
-fm_tasks_axi_compatible_probe() {
-  local parts major minor patch extra
+# True only when the tasks-axi compatibility verdict came from a probe that hit
+# its caller-supplied bound (in this process or handed down with the verdict),
+# so the caller can name that bound when it reports the failure.
+fm_tasks_axi_probe_timed_out() {  # [timeout]
+  fm_tasks_axi_compatible "${1:-}" && return 1
+  [ "$FM_TASKS_AXI_TIMED_OUT_MEMO" = 1 ] || [ "$FM_TASKS_AXI_PROBE_TIMED_OUT" = 1 ]
+}
+
+fm_tasks_axi_compatible_probe() {  # [timeout]
+  local timeout=${1:-} parts major minor patch extra status
   local min_major min_minor min_patch min_extra
-  parts=$(fm_tasks_axi_version_parts) || return 1
+  parts=$(fm_tasks_axi_version_parts "$timeout")
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    [ -n "$timeout" ] && fm_timed_out "$status" && FM_TASKS_AXI_PROBE_TIMED_OUT=1
+    return 1
+  fi
   [ -n "$parts" ] || return 1
   IFS=' ' read -r major minor patch extra <<< "$parts"
   # An unparseable version is incompatible, never assumed current, so a
@@ -87,23 +159,31 @@ fm_tasks_axi_compatible_probe() {
   if [ "$major" -gt "$min_major" ] ||
     { [ "$major" -eq "$min_major" ] && [ "$minor" -gt "$min_minor" ]; } ||
     { [ "$major" -eq "$min_major" ] && [ "$minor" -eq "$min_minor" ] && [ "$patch" -ge "$min_patch" ]; }; then
-    fm_tasks_axi_update_has_archive_body && fm_tasks_axi_mv_has_multi_id
+    fm_tasks_axi_update_has_archive_body "$timeout" && fm_tasks_axi_mv_has_multi_id "$timeout"
     return $?
   fi
   return 1
 }
 
-fm_tasks_axi_update_has_archive_body() {
-  local output
-  command -v tasks-axi >/dev/null 2>&1 || return 1
-  output=$(tasks-axi update --help 2>&1) || return 1
+fm_tasks_axi_update_has_archive_body() {  # [timeout]
+  local timeout=${1:-} output status
+  output=$(fm_tasks_axi_probe_run "$timeout" merge update --help)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    [ -n "$timeout" ] && fm_timed_out "$status" && FM_TASKS_AXI_PROBE_TIMED_OUT=1
+    return 1
+  fi
   printf '%s\n' "$output" | grep -F -- '--archive-body' >/dev/null
 }
 
-fm_tasks_axi_mv_has_multi_id() {
-  local output
-  command -v tasks-axi >/dev/null 2>&1 || return 1
-  output=$(tasks-axi mv --help 2>&1) || return 1
+fm_tasks_axi_mv_has_multi_id() {  # [timeout]
+  local timeout=${1:-} output status
+  output=$(fm_tasks_axi_probe_run "$timeout" merge mv --help)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    [ -n "$timeout" ] && fm_timed_out "$status" && FM_TASKS_AXI_PROBE_TIMED_OUT=1
+    return 1
+  fi
   printf '%s\n' "$output" | grep -F -- '[<id>...]' >/dev/null
 }
 

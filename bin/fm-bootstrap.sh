@@ -78,7 +78,12 @@
 #          line as any other unreadable version, naming the bound, so a timeout is
 #          never silently read as absent or as satisfied. The memo lives in this
 #          process only: nothing is cached on disk or across runs, because a stale
-#          version floor is worse than a slow one.
+#          version floor is worse than a slow one. The quota-axi and tasks-axi
+#          compatibility probes (bin/fm-quota-axi-lib.sh, bin/fm-tasks-axi-lib.sh)
+#          take the same bound as an argument, and bin/fm-session-start.sh passes
+#          it to its own tasks-axi probe and hands the verdict down with the
+#          bound-out marker, so every probe on the session-start path pays this
+#          one bounded wait at most once.
 #          tasks-axi and quota-axi are essential bootstrap tools.
 #          A compatible tasks-axi default backend is silent.
 #          quota-axi is required for the agent-owned dispatch-profile array
@@ -1540,11 +1545,19 @@ detect_local_tools() {
   elif ! tool_version_at_least lavish-axi "$LAVISH_AXI_MIN"; then
     echo "BOOTSTRAP_INFO: lavish-axi >=$LAVISH_AXI_MIN enables confirmed board replies; this older compatible version retains the legacy reply path, but upgrade to prevent handing back a board before its reply is accepted"
   fi
-  if command -v quota-axi >/dev/null 2>&1 && ! fm_quota_axi_compatible; then
-    echo "MISSING: quota-axi (install: $(install_cmd quota-axi))"
+  if command -v quota-axi >/dev/null 2>&1 && ! fm_quota_axi_compatible "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
+    if [ "${FM_QUOTA_AXI_PROBE_TIMED_OUT:-}" = 1 ]; then
+      echo "MISSING: quota-axi (install: $(install_cmd quota-axi); version probe hit the ${FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT}s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)"
+    else
+      echo "MISSING: quota-axi (install: $(install_cmd quota-axi))"
+    fi
   fi
-  if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
-    echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
+  if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
+    if fm_tasks_axi_probe_timed_out "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
+      echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi); version probe hit the ${FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT}s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)"
+    else
+      echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
+    fi
   fi
 }
 
@@ -1576,7 +1589,7 @@ detect_local_config() {
   fi
   crew_dispatch_validate
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
-    && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
+    && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
     echo "BOOTSTRAP_INFO: tasks-axi available"
   fi
   detect_code_root_backlog_fork
