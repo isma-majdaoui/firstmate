@@ -7,6 +7,9 @@
 #          Silent = all good.
 #          Lines: "MISSING: <tool> (install: <command>)",
 #                 "PRESENTATION_UNAVAILABLE: lavish-axi (requires >=<floor>; install: <command>) - nonvisual work may proceed with plain-text decisions and reports; install or upgrade before using Lavish",
+#                 where a bounded-out version probe appends
+#                 "; version probe hit the <n>s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked"
+#                 to that install clause,
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "STARTUP_MEMORY_BUDGET: invalid config/startup-memory-budget - <reason>",
@@ -64,6 +67,23 @@
 #          a compatible older build keeps legacy boards and reports a BOOTSTRAP_INFO
 #          upgrade recommendation for synchronous reply acceptance.
 #          tasks-axi feature probes remain a separate defense-in-depth check.
+#          Every external-tool version probe here is memoised for the life of this
+#          process and bounded by FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT (default 5s,
+#          non-numeric or non-positive values fall back to that default). One
+#          tool's several floors therefore cost one `<tool> --version` shell-out,
+#          each tool is probed independently of the others, and a slow or hanging
+#          tool costs one bounded wait instead of dominating the digest. A cached
+#          verdict is the verdict the probe produced - MISSING, unreadable, or
+#          satisfied - and a probe that hits its bound reports the same actionable
+#          line as any other unreadable version, naming the bound, so a timeout is
+#          never silently read as absent or as satisfied. The memo lives in this
+#          process only: nothing is cached on disk or across runs, because a stale
+#          version floor is worse than a slow one. The quota-axi and tasks-axi
+#          compatibility probes (bin/fm-quota-axi-lib.sh, bin/fm-tasks-axi-lib.sh)
+#          take the same bound as an argument, and bin/fm-session-start.sh passes
+#          it to its own tasks-axi probe and hands the verdict down with the
+#          bound-out marker, so every probe on the session-start path pays this
+#          one bounded wait at most once.
 #          tasks-axi and quota-axi are essential bootstrap tools.
 #          A compatible tasks-axi default backend is silent.
 #          quota-axi is required for the agent-owned dispatch-profile array
@@ -210,6 +230,9 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # deferred network stage sets, so an ordinary bootstrap run records nothing.
 # shellcheck source=bin/fm-timing-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-timing-lib.sh"
+# Every external-tool version probe below runs under fm_run_timed's hard bound.
+# shellcheck source=bin/fm-timeout-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 # Network-phase selection (see the header). An unrecognized value resolves to
 # `all` so a malformed override runs every step rather than silently dropping a
@@ -859,14 +882,90 @@ treehouse_supports_lease() {
 # cannot be parsed into exactly one major.minor.patch triple is incompatible,
 # never assumed current, so a development or vendored build cannot pass a floor
 # it was never checked against.
+#
+# Version-probe cost and bound (see the header): FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT
+# bounds one `<tool> --version` shell-out; the verdict is memoised per tool for
+# the life of this process, so several floors for one tool cost one probe. The
+# memo is held in shell variables, never on disk, because callers reach this
+# through command substitution far more often than not and a subshell's variable
+# is exactly where a file-based cache would have been needed.
+case "${FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT:-}" in
+  '' | *[!0-9]* | 0) FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT=5 ;;
+esac
+
+# Cache variable suffix for a tool name; only the tool names this script probes
+# are ever keyed, and the substitution keeps an unexpected name inert rather than
+# letting it build an arbitrary variable reference.
+fm_probe_cache_key() {  # <tool>
+  local tool=$1
+  case "$tool" in
+    *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  printf '%s' "${tool//[^A-Za-z0-9]/_}"
+}
+
+# Probe one tool's version once per process. Sets FM_TOOL_VERSION_STATE to one
+# of ok, absent, unreadable (nonzero exit or unparseable output), or timeout
+# (the bound fired), and FM_TOOL_VERSION_PARTS to the "major minor patch" triple
+# when the state is ok. Always returns 0 so callers read the state rather than a
+# status that cannot tell an absent tool from a bounded-out one.
+tool_version_probe() {  # <tool>
+  local tool=$1 key output status parts major minor patch extra state=unreadable
+  local seen_var state_var parts_var
+  if ! key=$(fm_probe_cache_key "$tool"); then
+    FM_TOOL_VERSION_STATE=unreadable
+    FM_TOOL_VERSION_PARTS=
+    return 0
+  fi
+  seen_var="FM_PROBE_SEEN_$key"
+  state_var="FM_PROBE_STATE_$key"
+  parts_var="FM_PROBE_PARTS_$key"
+  if [ -n "${!seen_var:-}" ]; then
+    FM_TOOL_VERSION_STATE=${!state_var}
+    FM_TOOL_VERSION_PARTS=${!parts_var}
+    return 0
+  fi
+  if command -v "$tool" >/dev/null 2>&1; then
+    output=$(fm_run_timed "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT" "$tool" --version 2>/dev/null)
+    status=$?
+    if fm_timed_out "$status"; then
+      state=timeout
+      parts=
+    elif [ "$status" -eq 0 ]; then
+      parts=$(printf '%s\n' "$output" | sed -nE 's/.*[vV]?([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/p' | head -n 1)
+      IFS=' ' read -r major minor patch extra <<< "$parts"
+      if [ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] && [ -z "$extra" ]; then
+        state=ok
+        parts="$major $minor $patch"
+      else
+        parts=
+      fi
+    else
+      parts=
+    fi
+  else
+    state=absent
+    parts=
+  fi
+  printf -v "$state_var" '%s' "$state"
+  printf -v "$parts_var" '%s' "$parts"
+  printf -v "$seen_var" '%s' 1
+  FM_TOOL_VERSION_STATE=$state
+  FM_TOOL_VERSION_PARTS=$parts
+}
+
+# True only when this tool's probe was bounded out, so a caller can report that
+# bound rather than the ordinary unreadable-version line.
+tool_version_probe_timed_out() {  # <tool>
+  tool_version_probe "$1"
+  [ "$FM_TOOL_VERSION_STATE" = timeout ]
+}
+
 tool_version_parts() {  # <tool>
-  local tool=$1 output parts major minor patch extra
-  command -v "$tool" >/dev/null 2>&1 || return 1
-  output=$("$tool" --version 2>/dev/null) || return 1
-  parts=$(printf '%s\n' "$output" | sed -nE 's/.*[vV]?([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/p' | head -n 1)
-  IFS=' ' read -r major minor patch extra <<< "$parts"
-  [ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] && [ -z "$extra" ] || return 1
-  printf '%s %s %s\n' "$major" "$minor" "$patch"
+  local tool=$1
+  tool_version_probe "$tool"
+  [ "$FM_TOOL_VERSION_STATE" = ok ] || return 1
+  printf '%s\n' "$FM_TOOL_VERSION_PARTS"
 }
 
 version_parts_at_least() {  # <major minor patch> <min-version>
@@ -882,9 +981,23 @@ version_parts_at_least() {  # <major minor patch> <min-version>
 }
 
 tool_version_at_least() {  # <tool> <min-version>
-  local parts
-  parts=$(tool_version_parts "$1") || return 1
-  version_parts_at_least "$parts" "$2"
+  local tool=$1
+  tool_version_probe "$tool"
+  [ "$FM_TOOL_VERSION_STATE" = ok ] || return 1
+  version_parts_at_least "$FM_TOOL_VERSION_PARTS" "$2"
+}
+
+# The parenthetical an actionable tool line carries after its tool name: the
+# install command on its own, or that install command plus the note that the
+# version floor could not be checked because the probe hit its bound.
+version_probe_diagnostic() {  # <tool> <install-command>
+  local tool=$1 install=$2
+  if tool_version_probe_timed_out "$tool"; then
+    printf 'install: %s; version probe hit the %ss FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked' \
+      "$install" "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"
+  else
+    printf 'install: %s' "$install"
+  fi
 }
 
 x_mode_write_if_changed() {
@@ -1422,21 +1535,29 @@ detect_local_tools() {
     echo "MISSING: treehouse (install: $(install_cmd treehouse))"
   fi
   if command -v no-mistakes >/dev/null 2>&1 && ! tool_version_at_least no-mistakes "$NO_MISTAKES_MIN"; then
-    echo "MISSING: no-mistakes (install: $(install_cmd no-mistakes))"
+    echo "MISSING: no-mistakes ($(version_probe_diagnostic no-mistakes "$(install_cmd no-mistakes)"))"
   fi
   if command -v gh-axi >/dev/null 2>&1 && ! tool_version_at_least gh-axi "$GH_AXI_MIN"; then
-    echo "MISSING: gh-axi (install: $(install_cmd gh-axi))"
+    echo "MISSING: gh-axi ($(version_probe_diagnostic gh-axi "$(install_cmd gh-axi)"))"
   fi
   if ! tool_version_at_least lavish-axi "$LAVISH_AXI_BOARD_MIN"; then
-    echo "PRESENTATION_UNAVAILABLE: lavish-axi (requires >=$LAVISH_AXI_BOARD_MIN; install: $(install_cmd lavish-axi)) - nonvisual work may proceed with plain-text decisions and reports; install or upgrade before using Lavish"
+    echo "PRESENTATION_UNAVAILABLE: lavish-axi (requires >=$LAVISH_AXI_BOARD_MIN; $(version_probe_diagnostic lavish-axi "$(install_cmd lavish-axi)")) - nonvisual work may proceed with plain-text decisions and reports; install or upgrade before using Lavish"
   elif ! tool_version_at_least lavish-axi "$LAVISH_AXI_MIN"; then
     echo "BOOTSTRAP_INFO: lavish-axi >=$LAVISH_AXI_MIN enables confirmed board replies; this older compatible version retains the legacy reply path, but upgrade to prevent handing back a board before its reply is accepted"
   fi
-  if command -v quota-axi >/dev/null 2>&1 && ! fm_quota_axi_compatible; then
-    echo "MISSING: quota-axi (install: $(install_cmd quota-axi))"
+  if command -v quota-axi >/dev/null 2>&1 && ! fm_quota_axi_compatible "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
+    if [ "${FM_QUOTA_AXI_PROBE_TIMED_OUT:-}" = 1 ]; then
+      echo "MISSING: quota-axi (install: $(install_cmd quota-axi); version probe hit the ${FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT}s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)"
+    else
+      echo "MISSING: quota-axi (install: $(install_cmd quota-axi))"
+    fi
   fi
-  if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
-    echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
+  if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
+    if fm_tasks_axi_probe_timed_out "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
+      echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi); version probe hit the ${FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT}s FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT bound, so the installed version floor could not be checked)"
+    else
+      echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
+    fi
   fi
 }
 
@@ -1468,7 +1589,7 @@ detect_local_config() {
   fi
   crew_dispatch_validate
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
-    && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
+    && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible "$FM_BOOTSTRAP_VERSION_PROBE_TIMEOUT"; then
     echo "BOOTSTRAP_INFO: tasks-axi available"
   fi
   detect_code_root_backlog_fork
